@@ -36,14 +36,6 @@ To get the value:
    `_strava4_session` (you can also grab it from the `Cookie` request header in the **Network** tab).
 3. Paste it as the `value` above.
 
-Notes:
-
-- `session.json` is gitignored — it holds an authenticated Strava session, so never commit or
-  share it.
-- Strava sessions expire. When that happens `get_strava_duration.py` prints
-  `No valid Strava session; export a logged-in session to session.json` — just regenerate
-  `session.json` following the steps above.
-
 ## 2. Run `sync.sh`
 
 ```bash
@@ -79,4 +71,4 @@ date. For example, to run it every day at 11pm, add a line like this to your cro
 0 23 * * * cd /path/to/strava_to_steptember && ./sync.sh me@example.com my_password >> /dev/null 2>&1
 ```
 
-(Adjust the path and credentials. The `>> sync.log` keeps a record of each run.)
+(Adjust the path and credentials.)
