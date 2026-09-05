@@ -3,6 +3,7 @@ import argparse
 import re
 import sys
 from datetime import date
+from pathlib import Path
 from typing import NoReturn
 
 import requests
@@ -20,6 +21,14 @@ ACTIVITY = "Cycling (outdoor, stationary)"
 def die(msg, code=1):
     print(msg)
     raise SystemExit(code)
+
+
+def dump_html(html, path="out.html"):
+    try:
+        Path(path).write_text(html, encoding="utf-8")
+        print(f"saved html to {path} ({len(html)} bytes)")
+    except Exception as e:
+        print(f"failed to save {path}: {e}")
 
 
 def fetch_token(session):
@@ -85,30 +94,32 @@ def get_activity_rate(html, activity):
     return mapping[activity]
 
 
-def add_activity(session, when, duration):
+def _load_activity_page(session):
     r = session.get(ACTIVITY_URL)
     r.raise_for_status()
     html = r.text
+    #dump_html(html, "out.html")
     if 'id="form-login"' in html:
         die("session expired before reaching activity page")
-
     soup = BeautifulSoup(html, "html.parser")
     form = soup.select_one("form#RegistrationForm")
     if form is None:
-        die("activity form (RegistrationForm) not found")
+        die("activity form (RegistrationForm) not found (see out.html)")
     token = form.select_one('input[name="CSRFToken"]')
     if token is None or not token.get("value"):
         die("CSRFToken not found in activity form")
     csrf = str(token.get("value"))
-
     m = re.search(r"history_id\s*=\s*(\d+)", html)
     if not m:
-        die("history_id not found on activity page")
+        die("history_id not found on activity page (see out.html)")
     history_id = m.group(1)
+    return html, soup, form, csrf, history_id
 
+
+def add_activity(session, when, duration):
+    html, soup, form, csrf, history_id = _load_activity_page(session)
     rate = get_activity_rate(html, ACTIVITY)
     steps = int(duration * rate / 60)
-
     payload = {
         "steps": steps,
         "date_from": when,
@@ -127,15 +138,15 @@ def add_activity(session, when, duration):
     except Exception:
         vj = {}
     vok = vj.get("success") is True
-    print(f"validate: success={vok} (steps={steps}, rate={rate}/hr)")
-
+    print(
+        f"validate: success={vok} (steps={steps}, rate={rate}/hr) raw={vj or v.text[:500]}"
+    )
     data = form_fields(form)
     data["CSRFToken"] = csrf
     data["date_from"] = when
     data["steps"] = str(steps)
     data["activity_type"] = ACTIVITY
     data["duration"] = str(duration)
-
     a = session.post(
         ADD,
         data=data,
@@ -144,42 +155,107 @@ def add_activity(session, when, duration):
     )
     a.raise_for_status()
     print(f"add: status={a.status_code} url={a.url}")
-
+    #dump_html(a.text, "out_add.html")
     after = session.get(ACTIVITY_URL)
     after.raise_for_status()
+    #dump_html(after.text, "out.html")
     ok = ACTIVITY in after.text and when in after.text
-    print(
-        "ACTIVITY LOGGED" if ok else "ACTIVITY MAY NOT HAVE SAVED (check output.html)"
+    print("ACTIVITY LOGGED" if ok else "ACTIVITY MAY NOT HAVE SAVED (check out.html)")
+
+
+def add_steps(session, when, steps):
+    html, soup, form, csrf, history_id = _load_activity_page(session)
+    if (
+        "Add your steps manually" not in html
+        and "add your steps manually" not in html.lower()
+    ):
+        print(
+            "note: 'Add your steps manually' text not found in page (see out.html), continuing with manual steps flow"
+        )
+    payload = {
+        "steps": steps,
+        "date_from": when,
+        "history_id": int(history_id),
+        "source": "manual",
+    }
+    v = session.post(
+        VALIDATE,
+        json=payload,
+        headers={"X-Requested-With": "XMLHttpRequest", "Referer": ACTIVITY_URL},
     )
+    try:
+        vj = v.json()
+    except Exception:
+        vj = {}
+    vok = vj.get("success") is True
+    print(f"validate: success={vok} (steps={steps}) raw={vj or v.text[:500]}")
+    data = form_fields(form)
+    data["CSRFToken"] = csrf
+    data["date_from"] = when
+    data["steps"] = str(steps)
+    data.pop("activity_type", None)
+    data.pop("duration", None)
+    data["activity_type"] = ""
+    data["duration"] = ""
+    # some implementations expect activity_type empty for manual steps; keep steps only
+    a = session.post(
+        ADD,
+        data=data,
+        headers={"Referer": ACTIVITY_URL},
+        allow_redirects=True,
+    )
+    a.raise_for_status()
+    print(f"add: status={a.status_code} url={a.url}")
+    #dump_html(a.text, "out_add.html")
+    after = session.get(ACTIVITY_URL)
+    after.raise_for_status()
+    #dump_html(after.text, "out.html")
+    ok = when in after.text and str(steps) in after.text
+    print("STEPS LOGGED" if ok else "STEPS MAY NOT HAVE SAVED (check out.html)")
 
 
 def main():
     p = argparse.ArgumentParser(
-        description="Log in to Steptember and add a cycling activity."
+        description="Log in to Steptember and add steps or a cycling activity."
     )
     p.add_argument("email")
     p.add_argument("password")
-    p.add_argument("--duration", type=int, required=True, help="duration in minutes")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument(
+        "--duration", type=int, help="duration in minutes (uses activity conversion)"
+    )
+    g.add_argument(
+        "--steps", type=int, help="number of steps (uses 'Add your steps manually')"
+    )
     p.add_argument(
         "--date",
         default=date.today().isoformat(),
         help="activity date YYYY-MM-DD (default: today)",
     )
+    p.add_argument(
+        "--activity",
+        default=ACTIVITY,
+        help=f"activity name for --duration (default: {ACTIVITY})",
+    )
     args = p.parse_args()
-
+    globals()["ACTIVITY"] = args.activity
     session = requests.Session()
     session.headers.update({"User-Agent": UA})
-
     token = fetch_token(session)
     res = do_login(session, args.email, args.password, token)
-
     if 'id="form-login"' in res.text:
         die("LOGIN FAILED (credentials rejected or form re-rendered)")
     if not logged_in(session):
         die("LOGIN FAILED (no authenticated session detected)")
     print("LOGIN OK")
-
-    add_activity(session, args.date, args.duration)
+    if args.steps is not None:
+        if args.steps <= 0:
+            die("--steps must be > 0")
+        add_steps(session, args.date, args.steps)
+    else:
+        if args.duration <= 0:
+            die("--duration must be > 0")
+        add_activity(session, args.date, args.duration)
 
 
 if __name__ == "__main__":
